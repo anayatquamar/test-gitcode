@@ -1,36 +1,150 @@
-# This is a basic workflow to help you get started with Actions
+name: Terraform CI/CD
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+    paths:
+      - 'environments/**'
+      - 'modules/**'
   pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches:
+      - main
+    paths:
+      - 'environments/**'
+      - 'modules/**'
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (preprod/prod)'
+        required: true
+        default: 'preprod'
+        type: choice
+        options:
+          - preprod
+          - prod
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+env:
+  TF_VERSION: "1.9.0"
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  security-scan:
+    name: Security & Lint Scans
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    strategy:
+      matrix:
+        environment: [preprod, prod]
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      # --- Gitleaks (secret scanning) ---
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          config-path: environments/${{ matrix.environment }}/.gitleaks.toml
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      # --- TFLint (terraform linting) ---
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Run TFLint
+        working-directory: environments/${{ matrix.environment }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          tflint --init
+          tflint --format=json > tflint-report.json || true
+          cat tflint-report.json
+
+      # --- TFSec (terraform security scan) ---
+      - name: Run TFSec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: environments/${{ matrix.environment }}
+          format: json
+          soft_fail: true
+
+      - name: Upload scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ matrix.environment }}
+          path: |
+            environments/${{ matrix.environment }}/gitleaks-report.json
+            environments/${{ matrix.environment }}/tflint-report.json
+            environments/${{ matrix.environment }}/tfsec-report.json
+
+  terraform-plan:
+    name: Terraform Plan
+    needs: security-scan
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [preprod, prod]
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan-${{ matrix.environment }}
+
+      - name: Upload Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: environments/${{ matrix.environment }}/tfplan-${{ matrix.environment }}
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'preprod' }}
+    defaults:
+      run:
+        working-directory: environments/${{ github.event.inputs.environment || 'preprod' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.event.inputs.environment || 'preprod' }}
+          path: environments/${{ github.event.inputs.environment || 'preprod' }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan-${{ github.event.inputs.environment || 'preprod' }}
